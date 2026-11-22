@@ -13,8 +13,10 @@ Protocol (approved; Lu et al. settings where they are stated):
   once per optimizer step, so each DARL layer's EMA updates once per step.
   Measurement passes run in ``model.eval()``, where D is frozen.
 * Fail-fast: a non-finite preactivation (DARL ``check_finite``), loss,
-  gradient or parameter stops the run with status "nonfinite". The event is
-  recorded and kept as an outcome; it is never silently retried.
+  gradient or parameter stops the run with status "nonfinite". This applies
+  to training steps and to the initial and scheduled evaluations alike; the
+  failure records its phase. The event is kept as a terminal outcome and is
+  never silently retried. Errors that are not NaN/Inf still propagate.
 * Checkpoints at epoch boundaries (atomic). Resuming continues bitwise
   identically on CPU: model, Adam state, DARL state, batch-order RNG, step
   counters and history are all restored.
@@ -292,10 +294,25 @@ def train(
     x, y = data["train"].x, data["train"].y
     n, bs = x.shape[0], cfg.batch_size
 
-    if st["status"] == "running" and st["epoch"] == 0 and not st["history"]:
-        st["history"].append(evaluate(model, data, 0, 0, None, None, extra_metrics))
+    def measure(loss_epoch: Optional[float], phase: str) -> bool:
+        """Append one history record. A NaN/Inf raised while measuring (initial
+        or scheduled evaluation, including DARL's input check) ends the run
+        with a recorded terminal "nonfinite" status instead of escaping."""
+        try:
+            rec = evaluate(model, data, st["epoch"], st["step"], loss_epoch,
+                           alpha_time_mean(), extra_metrics)
+        except FloatingPointError as e:
+            st["status"] = "nonfinite"
+            st["failure"] = {"epoch": st["epoch"], "step": st["step"], "phase": phase,
+                             "error": type(e).__name__, "message": str(e)}
+            return False
+        st["history"].append(rec)
         if progress:
-            progress(st["history"][-1])
+            progress(rec)
+        return True
+
+    if st["status"] == "running" and st["epoch"] == 0 and not st["history"]:
+        measure(None, "initial_evaluation")
 
     while st["status"] == "running" and st["epoch"] < cfg.epochs:
         if stop_after_epoch is not None and st["epoch"] >= stop_after_epoch:
@@ -327,15 +344,12 @@ def train(
                     st["alpha_sum"] += float(torch.cat([m.alpha for m in darl]).mean())
         except FloatingPointError as e:  # includes DARL's check and NonFiniteError
             st["status"] = "nonfinite"
-            st["failure"] = {"epoch": st["epoch"] + 1, "step": current_step,
+            st["failure"] = {"epoch": st["epoch"] + 1, "step": current_step, "phase": "training_step",
                              "error": type(e).__name__, "message": str(e)}
             break
         st["epoch"] += 1
-        if st["epoch"] in marks:
-            st["history"].append(evaluate(model, data, st["epoch"], st["step"], loss_sum / n,
-                                          alpha_time_mean(), extra_metrics))
-            if progress:
-                progress(st["history"][-1])
+        if st["epoch"] in marks and not measure(loss_sum / n, "scheduled_evaluation"):
+            break
         if st["epoch"] == cfg.epochs:
             st["status"] = "completed"
         st["wall_seconds"] = wall0 + time.perf_counter() - t_start

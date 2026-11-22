@@ -1,0 +1,9 @@
+{
+  "collapse_std_frac": 0.01,
+  "success_val_mse": 0.001,
+  "half_fit_mse": 0.001,
+  "half_flat_std_frac": 0.01,
+  "const_range_tol": 1e-06,
+  "frozen": false,
+  "frozen_note": "DRAFT - to be calibrated on ReLU pilot runs, then frozen"
+}

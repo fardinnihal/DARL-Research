@@ -228,8 +228,12 @@ class TestNonFinite:
             return out
 
         monkeypatch.setattr(train_mod, "initialize_", bad_init)
-        with pytest.raises(FloatingPointError):
-            train(cfg("darl", epochs=2))  # the initial evaluation already sees inf
+        # Step 5 review fix: the initial evaluation's NaN/Inf is now recorded
+        # as a terminal nonfinite result instead of escaping as an exception.
+        r = train(cfg("darl", epochs=2))
+        assert r["status"] == "nonfinite"
+        assert r["failure"]["phase"] == "initial_evaluation"
+        assert r["failure"]["error"] == "FloatingPointError"  # DARL's own check
 
     def test_nonfinite_error_is_a_floating_point_error(self):
         assert issubclass(NonFiniteError, FloatingPointError)
@@ -251,3 +255,95 @@ def test_timing_script_runs(tmp_path):
     assert len(rec["measurements"]) == 2
     assert all(m["steps_per_epoch"] == 24 for m in rec["measurements"])
     assert all(m["projected_seconds_per_run"] > 0 for m in rec["measurements"])
+
+
+# ------------------------------------- Step 5 review: evaluation-time NaN/Inf
+def _inf_weight_init(monkeypatch):
+    real_init = train_mod.initialize_
+
+    def bad_init(model, scheme, seed):
+        out = real_init(model, scheme, seed)
+        with torch.no_grad():
+            model.linears[0].weight[0, 0] = float("inf")
+        return out
+
+    monkeypatch.setattr(train_mod, "initialize_", bad_init)
+
+
+class TestEvaluationNonFinite:
+    @pytest.mark.parametrize("act,kw", ARMS)
+    def test_initial_evaluation_failure_is_recorded(self, monkeypatch, tmp_path, act, kw):
+        _inf_weight_init(monkeypatch)
+        r = train(cfg(act, kw), run_dir=tmp_path)
+        assert r["status"] == "nonfinite"
+        assert r["failure"]["phase"] == "initial_evaluation"
+        assert (r["failure"]["epoch"], r["failure"]["step"]) == (0, 0)
+        assert r["steps_completed"] == 0 and r["history"] == [] and r["final"] is None
+        saved = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+        assert saved["status"] == "nonfinite" and saved["failure"]["phase"] == "initial_evaluation"
+        assert (tmp_path / "checkpoint.pt").exists()
+
+    def test_initial_failure_is_terminal_on_resume(self, monkeypatch, tmp_path):
+        _inf_weight_init(monkeypatch)
+        first = train(cfg("darl"), run_dir=tmp_path)
+        monkeypatch.undo()  # even with a healthy init, the saved run stays terminal
+        again = train(cfg("darl"), run_dir=tmp_path)
+        assert again["status"] == "nonfinite" and again["failure"] == first["failure"]
+        assert again["steps_completed"] == 0
+
+    def test_scheduled_evaluation_failure_is_recorded(self, tmp_path):
+        def hook(model, data):
+            if model.darl_layers() and int(model.darl_layers()[0].num_updates) >= 48:
+                raise FloatingPointError("injected non-finite metric")
+            return {}
+
+        r = train(cfg("darl", epochs=6), run_dir=tmp_path, extra_metrics=hook)
+        assert r["status"] == "nonfinite"
+        f = r["failure"]
+        assert f["phase"] == "scheduled_evaluation" and f["epoch"] == 2 and f["step"] == 48
+        assert [h["epoch"] for h in r["history"]] == [0, 1]  # records before the failure kept
+        assert r["epochs_completed"] == 2  # no training after the failed measurement
+        saved = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+        assert saved["failure"]["phase"] == "scheduled_evaluation"
+        again = train(cfg("darl", epochs=6), run_dir=tmp_path, extra_metrics=hook)
+        assert again["status"] == "nonfinite" and again["epochs_completed"] == 2
+
+    def test_nonfinite_error_raised_by_evaluate_itself_is_recorded(self, monkeypatch):
+        real = train_mod._mse
+        calls = {"n": 0}
+
+        def nan_val(pred, target):
+            out = real(pred, target)
+            if pred.shape[0] == 1000:  # validation pass inside evaluate()
+                calls["n"] += 1
+                if calls["n"] == 3:
+                    return out * float("nan")
+            return out
+
+        monkeypatch.setattr(train_mod, "_mse", nan_val)
+        r = train(cfg("relu", epochs=6))
+        assert r["status"] == "nonfinite"
+        assert r["failure"]["error"] == "NonFiniteError"
+        assert r["failure"]["phase"] == "scheduled_evaluation" and r["failure"]["epoch"] == 2
+
+    def test_training_step_failures_name_their_phase(self, monkeypatch):
+        real = train_mod._mse
+        calls = {"n": 0}
+
+        def fake(pred, target):
+            out = real(pred, target)
+            if pred.shape[0] in (128, 56):
+                calls["n"] += 1
+                if calls["n"] == 5:
+                    return out * float("nan")
+            return out
+
+        monkeypatch.setattr(train_mod, "_mse", fake)
+        assert train(cfg("relu"))["failure"]["phase"] == "training_step"
+
+    def test_other_evaluation_errors_still_propagate(self):
+        def broken(model, data):
+            raise KeyError("a bug, not a NaN")
+
+        with pytest.raises(KeyError):
+            train(cfg("relu", epochs=2), extra_metrics=broken)
