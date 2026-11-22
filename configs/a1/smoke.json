@@ -1,0 +1,27 @@
+{
+  "comment": "SMOKE TEST: 4 arms x 3 seeds x 20 epochs. Checks the pipeline end to end (training, checkpoints, resume, metrics, outcome labels). Not research results; thresholds stay DRAFT.",
+  "name": "smoke",
+  "mode": "smoke",
+  "seeds": {"start": 0, "count": 3},
+  "train": {
+    "epochs": 20,
+    "batch_size": 128,
+    "lr": 0.001,
+    "betas": [0.9, 0.999],
+    "eps": 1e-08,
+    "weight_decay": 0.0,
+    "n_layers": 10,
+    "width": 2,
+    "log_every": 10,
+    "checkpoint_every": 5
+  },
+  "arms": [
+    {"name": "ReLU-He", "activation": "relu", "init": "he"},
+    {"name": "ReLU-RAI", "activation": "relu", "init": "rai"},
+    {"name": "LReLU001-He", "activation": "leaky_relu", "init": "he", "act_kwargs": {"negative_slope": 0.01}},
+    {"name": "DARL-He", "activation": "darl", "init": "he"}
+  ],
+  "data_config": "configs/a1/data.json",
+  "thresholds": "configs/a1/outcomes.json",
+  "results_root": "results/a1"
+}
