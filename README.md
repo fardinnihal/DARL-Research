@@ -1,4 +1,4 @@
-# DARL study — Stage 1: DARL module and unit tests
+# DARL study — Stage 1: DARL module and unit tests (validation fixes applied)
 
 Stage 1 contains only the DARL activation (proposal §5.1–5.3) and its tests.
 DSReLU, ReDo and the training pipeline come after these tests pass on your machine.
@@ -19,7 +19,9 @@ darl-study/
 ├── scripts/
 │   └── darl_demo.py                  # prints how D and alpha evolve for three units
 └── tests/
-    └── test_darl.py                  # 55 unit tests (54 run on CPU, 1 needs CUDA)
+    ├── test_darl.py                  # 55 original unit tests (54 run on CPU, 1 needs CUDA)
+    ├── test_darl_validation.py       # 35 regression tests for the input/state validation fixes
+    └── test_darl_integration.py      # 16 tests: real optimizer steps and full checkpoint resume
 ```
 
 ## Install (Windows 11, CPU, PyCharm)
@@ -45,20 +47,34 @@ If PowerShell blocks `activate`, run `Set-ExecutionPolicy -Scope CurrentUser Rem
 
 ## Run
 
+From PyCharm's **Terminal** tab, with `.venv` active, in the `darl-study` folder:
+
 ```powershell
+# every test (all three files)
 python -m pytest -v
+
+# one file at a time
+python -m pytest -v tests\test_darl.py
+python -m pytest -v tests\test_darl_validation.py
+python -m pytest -v tests\test_darl_integration.py
+
+# demo
 python scripts\darl_demo.py
 ```
 
-In PyCharm you can also right-click `tests/test_darl.py` → **Run 'pytest in test_darl.py'**.
+In the PyCharm GUI: right-click the `tests` folder → **Run 'pytest in tests'** to run everything, or right-click a single test file → **Run 'pytest in <file>'**.
+
+If you installed an earlier Stage 1 copy, run `pip install -e ".[dev]"` again in the new folder so Python imports this version.
 
 ## Expected output and pass criteria
 
 **Tests:** the last line should read
 
 ```
-54 passed, 1 skipped in X.XXs
+105 passed, 1 skipped in X.XXs
 ```
+
+Per file: `test_darl.py` 54 passed, 1 skipped; `test_darl_validation.py` 35 passed; `test_darl_integration.py` 16 passed.
 
 The one skipped test is `test_cuda_matches_cpu`, which runs only where CUDA exists (it will run on Colab). **Any failure or error means Stage 1 is not complete.** Send the full `pytest -v` output.
 
@@ -87,6 +103,9 @@ Check: unit 0 (always inactive) satisfies D = 1 − 0.99^t, so 0.6340 at t = 100
 | Eval mode | state frozen even when marked; uses last training α; a sample's output does not depend on the rest of the batch | §5.3 |
 | Checkpoints | D, update count and hyperparameters in `state_dict`; save/load round trip; mismatched hyperparameters rejected; stop-and-resume equals an uninterrupted run | Resume requirement |
 | Dtype/device | `.half()` keeps D in float32; bfloat16 input works; CUDA equals CPU (Colab only) | D15 |
+| Validation (new) | empty batches rejected before D is touched; NaN/Inf rejected in `d_init`, hyperparameters, `reset_state` and `load_state_dict`; `unit_dim` must be an int ≥ 1 and inside the input's rank; finite-value check on by default and switchable off without changing values | Review fixes |
+| Optimizer integration (new) | SGD+momentum and Adam steps change weights; `num_updates` equals tracked steps; D equals a hand-recomputed EMA of the recorded preactivations; gradients reach all parameters and never D; eval and untracked passes leave D unchanged | §5.3, D2, D4 |
+| Full resume (new) | model, optimizer, DARL state, step and torch/numpy/python RNG saved mid-run and loaded into fresh objects; losses, parameters, D, counters and optimizer state are bitwise equal to an uninterrupted run (SGD and Adam, two split points) | Resume requirement |
 
 ## How to use DARL in a training loop
 
@@ -103,5 +122,11 @@ optimizer.step()
 
 model.eval()                        # D frozen; metric passes never change it
 ```
+
+### Finite-value checking
+
+`DARL(..., check_finite=True)` is the default. Every forward pass raises `FloatingPointError` if the input contains NaN or Inf, before D is updated, so a diverging run stops at the first bad batch instead of silently writing a wrong state. Keep it on for debugging and pilot runs.
+
+For timed performance experiments only, pass `check_finite=False`. The check reads the whole tensor and on CUDA forces a GPU-to-CPU sync each forward; switching it off never changes any computed value (a test checks this). Empty batches and bad `unit_dim` values are rejected either way.
 
 A forward pass in train mode **without** `darl_tracking` leaves D unchanged by design (decision D4). The training pipeline in a later stage will always wrap its training forward in it.

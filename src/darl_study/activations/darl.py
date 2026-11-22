@@ -34,6 +34,7 @@ The state D is a buffer, never a trainable parameter, and receives no gradient
 from __future__ import annotations
 
 import contextlib
+import math
 from typing import Any, Dict, Iterator, Sequence
 
 import torch
@@ -56,11 +57,41 @@ def inactive_fraction(z: torch.Tensor, unit_dim: int = 1) -> torch.Tensor:
 
     Returns a float32 tensor of shape (z.shape[unit_dim],).
     ``-0.0 <= 0`` is True, so negative zeros count as inactive. NaN compares
-    False, so a NaN entry counts as active (see ``DARL(check_finite=True)``).
+    False, so a NaN entry would count as active; ``DARL`` rejects non-finite
+    input by default (``check_finite=True``).
+
+    Raises ValueError if ``z`` is empty or ``unit_dim`` is not a valid
+    non-batch dimension of ``z`` (validation only; the formula is unchanged).
     """
-    unit_dim = unit_dim % z.dim()
+    _check_unit_dim(unit_dim, z.dim())
+    if z.numel() == 0:
+        raise ValueError(f"cannot compute inactivity of an empty tensor of shape {tuple(z.shape)}")
     reduce_dims = [d for d in range(z.dim()) if d != unit_dim]
     return (z <= 0).to(torch.float32).mean(dim=reduce_dims)
+
+
+def _check_unit_dim(unit_dim: int, ndim: int | None = None) -> None:
+    """Validation: dim 0 is the batch dimension and can never index units."""
+    if isinstance(unit_dim, bool) or not isinstance(unit_dim, int):
+        raise ValueError(f"unit_dim must be an int, got {unit_dim!r}")
+    if unit_dim < 1:
+        raise ValueError(
+            f"unit_dim must be >= 1 (dim 0 is the batch dimension; negative "
+            f"indices are not accepted), got {unit_dim}"
+        )
+    if ndim is not None and unit_dim >= ndim:
+        raise ValueError(
+            f"unit_dim={unit_dim} is out of range for an input with {ndim} dims"
+        )
+
+
+def _check_finite_scalar(name: str, value) -> None:
+    try:
+        ok = math.isfinite(float(value))
+    except (TypeError, ValueError):
+        ok = False
+    if not ok:
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
 
 
 def darl_slope(
@@ -79,8 +110,13 @@ class DARL(nn.Module):
         p: exponent of the slope rule, p > 0.
         rho: EMA momentum, 0 <= rho < 1.
         unit_dim: tensor dimension that indexes units (1 for (B, n) and (B, C, H, W)).
-        d_init: initial value of every D_j, in [0, 1]. Default 0 (decision D1).
-        check_finite: if True, raise when the input contains NaN or Inf.
+            Must be >= 1, because dim 0 is the batch dimension.
+        d_init: initial value of every D_j, finite and in [0, 1]. Default 0 (D1).
+        check_finite: if True (default), raise FloatingPointError when the input
+            contains NaN or Inf. Recommended for all debugging and pilot runs.
+            Set False only for timed performance experiments: the check reads
+            the whole tensor and, on CUDA, forces a GPU-to-CPU synchronisation
+            on every forward pass. It never changes the computed values.
     """
 
     _EXTRA_STATE_VERSION = 1
@@ -94,11 +130,15 @@ class DARL(nn.Module):
         rho: float = 0.99,
         unit_dim: int = 1,
         d_init: float = 0.0,
-        check_finite: bool = False,
+        check_finite: bool = True,
     ) -> None:
         super().__init__()
-        if not isinstance(num_units, int) or num_units < 1:
+        if isinstance(num_units, bool) or not isinstance(num_units, int) or num_units < 1:
             raise ValueError(f"num_units must be a positive int, got {num_units!r}")
+        for name, value in (("alpha_min", alpha_min), ("alpha_max", alpha_max),
+                            ("p", p), ("rho", rho), ("d_init", d_init)):
+            _check_finite_scalar(name, value)
+        _check_unit_dim(unit_dim)
         if not (0.0 < alpha_min <= alpha_max <= 1.0):
             raise ValueError(
                 "require 0 < alpha_min <= alpha_max <= 1, got "
@@ -139,10 +179,23 @@ class DARL(nn.Module):
         value_t = torch.as_tensor(value, dtype=torch.float32, device=self.D.device)
         if value_t.numel() not in (1, self.num_units):
             raise ValueError("value must be a scalar or have num_units entries")
-        if torch.any(value_t < 0) or torch.any(value_t > 1):
-            raise ValueError("D values must lie in [0, 1]")
-        self.D.copy_(value_t.expand_as(self.D))
+        self._validate_state_values(value_t)
+        self.D.copy_(value_t.reshape(-1).expand_as(self.D))
         self.num_updates.zero_()
+
+    @staticmethod
+    def _validate_state_values(values: torch.Tensor) -> None:
+        """Validation: D must be finite and inside [0, 1] (NaN fails both checks)."""
+        if not torch.isfinite(values).all():
+            raise ValueError("D values must be finite (no NaN or Inf)")
+        if torch.any(values < 0) or torch.any(values > 1):
+            raise ValueError("D values must lie in [0, 1]")
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        key = prefix + "D"
+        if key in state_dict:
+            self._validate_state_values(state_dict[key].detach().to(torch.float32))
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     @torch.no_grad()
     def _update_state(self, z: torch.Tensor) -> None:
@@ -157,11 +210,21 @@ class DARL(nn.Module):
             self.D = self.D.to(torch.float32)
         return module
 
+    def _effective_alpha(self) -> torch.Tensor:
+        """Slopes applied in forward. Controls (e.g. shuffled-slope) override this."""
+        return darl_slope(self.D, self.alpha_min, self.alpha_max, self.p)
+
     # ---------------------------------------------------------------- forward
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         if z.dim() < 2:
             raise ValueError("DARL expects a batched input with at least 2 dims")
-        unit_dim = self.unit_dim % z.dim()
+        _check_unit_dim(self.unit_dim, z.dim())
+        unit_dim = self.unit_dim
+        if z.numel() == 0:
+            raise ValueError(
+                f"DARL received an empty batch of shape {tuple(z.shape)}; "
+                "an empty batch has no inactivity fraction and would corrupt D"
+            )
         if z.shape[unit_dim] != self.num_units:
             raise ValueError(
                 f"input has {z.shape[unit_dim]} units along dim {unit_dim}, "
@@ -176,7 +239,7 @@ class DARL(nn.Module):
 
         # Proposal 5.2: slope from the (just updated) state D(t); no gradient.
         with torch.no_grad():
-            alpha = darl_slope(self.D, self.alpha_min, self.alpha_max, self.p)
+            alpha = self._effective_alpha()
         shape = [1] * z.dim()
         shape[unit_dim] = self.num_units
         alpha = alpha.to(dtype=z.dtype).view(shape)
