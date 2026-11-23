@@ -1,0 +1,25 @@
+{
+  "comment": "A1 RELU PILOT (Stage 2, Step 7): ReLU-He and ReLU-RAI only, 20 seeds each, 2,000-epoch candidate budget. Used ONLY to (1) check the training budget with the approved training-loss plateau criterion and (2) calibrate the outcome thresholds. Pilot results are never research results. Seeds 0-19 are spent here; main runs must use a disjoint seed range. No DARL or LeakyReLU arm until the thresholds and budget are frozen.",
+  "name": "relu-pilot",
+  "mode": "pilot",
+  "seeds": {"start": 0, "count": 20},
+  "train": {
+    "epochs": 2000,
+    "batch_size": 128,
+    "lr": 0.001,
+    "betas": [0.9, 0.999],
+    "eps": 1e-08,
+    "weight_decay": 0.0,
+    "n_layers": 10,
+    "width": 2,
+    "log_every": 10,
+    "checkpoint_every": 50
+  },
+  "arms": [
+    {"name": "ReLU-He", "activation": "relu", "init": "he"},
+    {"name": "ReLU-RAI", "activation": "relu", "init": "rai"}
+  ],
+  "data_config": "configs/a1/data.json",
+  "thresholds": "configs/a1/outcomes.json",
+  "results_root": "results/a1"
+}

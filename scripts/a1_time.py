@@ -2,7 +2,7 @@
 
 Runs a short training (default 20 epochs, 2 seeds, after one untimed
 warm-up) for each requested arm through the real training loop, with the
-pilot's checkpoint cadence. It times one measurement record separately, so
+pilot's checkpoint cadence and the runner's A1 metrics hook. It times one measurement record separately, so
 the cost splits into training per epoch plus measurement per record, and a
 2,000-epoch run is projected with its real number of records (204). It then projects wall-clock time for
 the planned run modes. Nothing here changes any scientific setting; timing
@@ -35,6 +35,7 @@ import torch
 
 from darl_study.a1.data import build_a1_datasets
 from darl_study.a1.init import INIT_SCHEMES, initialize_
+from darl_study.a1.metrics import a1_extra_metrics
 from darl_study.a1.model import ACTIVATIONS, DeepNarrowMLP
 from darl_study.a1.train import TrainConfig, evaluate, log_epochs, train
 
@@ -43,14 +44,15 @@ ACT_KWARGS = {"relu": {}, "leaky_relu": {"negative_slope": 0.01}, "darl": {}}
 
 
 def _eval_seconds(act: str, init: str, reps: int = 20) -> float:
-    """Cost of one measurement record (full train/val/probe passes + gradient)."""
+    """Cost of one measurement record as the runner makes it: full train/val/probe
+    passes, gradient, and the A1 neuron and shape metrics (``a1_extra_metrics``)."""
     model = DeepNarrowMLP(activation=act, act_kwargs=ACT_KWARGS[act])
     initialize_(model, init, 0)
     data = build_a1_datasets()
-    evaluate(model, data, 0, 0)  # warm-up
+    evaluate(model, data, 0, 0, extra_metrics=a1_extra_metrics)  # warm-up
     t0 = time.perf_counter()
     for _ in range(reps):
-        evaluate(model, data, 0, 0)
+        evaluate(model, data, 0, 0, extra_metrics=a1_extra_metrics)
     return (time.perf_counter() - t0) / reps
 
 
@@ -64,12 +66,12 @@ def measure(act: str, init: str, seeds: Sequence[int], epochs: int,
     steps = 0
     with tempfile.TemporaryDirectory() as tmp:
         warm = TrainConfig(activation=act, act_kwargs=ACT_KWARGS[act], init=init, run_seed=999_999, epochs=2)
-        train(warm)  # warm-up, not timed
+        train(warm, extra_metrics=a1_extra_metrics)  # warm-up, not timed
         for s in seeds:
             cfg = TrainConfig(activation=act, act_kwargs=ACT_KWARGS[act], init=init, run_seed=s,
                               epochs=epochs, log_every=log_every, checkpoint_every=checkpoint_every)
             t0 = time.perf_counter()
-            r = train(cfg, run_dir=Path(tmp) / f"seed{s}")
+            r = train(cfg, run_dir=Path(tmp) / f"seed{s}", extra_metrics=a1_extra_metrics)
             dt = time.perf_counter() - t0
             done = max(r["epochs_completed"], 1)
             per_epoch.append(max(dt - n_records * eval_s, 0.0) / done)
