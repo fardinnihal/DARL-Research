@@ -76,6 +76,8 @@ __all__ = [
     "Arm",
     "ExperimentConfig",
     "load_experiment",
+    "experiment_from_dict",
+    "used_seed_ranges",
     "run_dir_for",
     "run_status",
     "run_one",
@@ -166,7 +168,11 @@ class ExperimentConfig:
 
 
 def load_experiment(path: Union[str, Path], **overrides: Any) -> ExperimentConfig:
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    return experiment_from_dict(json.loads(Path(path).read_text(encoding="utf-8")), **overrides)
+
+
+def experiment_from_dict(raw: Dict[str, Any], **overrides: Any) -> ExperimentConfig:
+    """Same as ``load_experiment`` for an already parsed JSON object."""
     allowed = {"name", "mode", "seeds", "arms", "train", "data_config", "thresholds", "results_root", "comment"}
     unknown = set(raw) - allowed
     if unknown:
@@ -340,6 +346,32 @@ def _git_info() -> Dict[str, Any]:
         return {"git_commit": None, "git_dirty": None}
 
 
+def used_seed_ranges(results_root: Path) -> List[Dict[str, Any]]:
+    """Seed ranges of every pilot and calibration experiment recorded under ``results_root``."""
+    used = []
+    for mode in ("pilot", "calibration"):
+        for rec_path in sorted((results_root / mode).glob("*/experiment.json")):
+            rec = _read_json(rec_path)
+            e = (rec or {}).get("experiment") or {}
+            s, c = e.get("seed_start"), e.get("seed_count")
+            if isinstance(s, int) and isinstance(c, int):
+                used.append({"mode": mode, "name": e.get("name"), "start": s, "count": c,
+                             "record": str(rec_path)})
+    return used
+
+
+def _check_main_seeds(exp: ExperimentConfig) -> None:
+    """A main experiment never reuses a seed spent on a pilot or calibration run."""
+    if exp.mode != "main":
+        return
+    a0, a1 = exp.seed_start, exp.seed_start + exp.seed_count
+    for u in used_seed_ranges(exp.path(exp.results_root)):
+        b0, b1 = u["start"], u["start"] + u["count"]
+        if a0 < b1 and b0 < a1:
+            raise ValueError(f"main seeds {a0}-{a1 - 1} overlap {u['mode']} '{u['name']}' seeds "
+                             f"{b0}-{b1 - 1} ({u['record']}); pilot and calibration seeds are never reused")
+
+
 def _jobs(exp: ExperimentConfig, th: OutcomeThresholds, arms: Sequence[Arm], threads: int) -> List[Dict[str, Any]]:
     data_cfg = load_data_config(exp.path(exp.data_config))
     jobs = []
@@ -426,6 +458,7 @@ def run_experiment(
 ) -> List[Dict[str, Any]]:
     """Run every (arm, seed) of the experiment. Returns one summary per run."""
     th = load_thresholds(exp.path(exp.thresholds), purpose=exp.purpose)  # main refuses drafts here
+    _check_main_seeds(exp)  # main refuses seeds spent on a recorded pilot or calibration
     arms = list(exp.arms)
     if arm_names is not None:
         wanted = list(arm_names)

@@ -1,0 +1,39 @@
+{
+  "comment": "A1 STEP 9 CALIBRATION: DARL-He and DARL-RAI, approved defaults (alpha_min 0.01, alpha_max 0.3, p 1, rho 0.99, D(0)=0), 20 seeds each, the frozen 2,000-epoch budget. Used ONLY to measure DARL's training-averaged negative slope for the slope-matched LeakyReLU control (decision D7). Never research results. Seeds 20-39 are spent here; the pilot spent 0-19; main uses 1000-1999.",
+  "name": "darl-slope-calibration",
+  "mode": "calibration",
+  "seeds": {
+    "start": 20,
+    "count": 20
+  },
+  "train": {
+    "epochs": 2000,
+    "batch_size": 128,
+    "lr": 0.001,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "weight_decay": 0.0,
+    "n_layers": 10,
+    "width": 2,
+    "log_every": 10,
+    "checkpoint_every": 50
+  },
+  "arms": [
+    {
+      "name": "DARL-He",
+      "activation": "darl",
+      "init": "he"
+    },
+    {
+      "name": "DARL-RAI",
+      "activation": "darl",
+      "init": "rai"
+    }
+  ],
+  "data_config": "configs/a1/data.json",
+  "thresholds": "configs/a1/outcomes.json",
+  "results_root": "results/a1"
+}

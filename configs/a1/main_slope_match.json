@@ -1,0 +1,314 @@
+{
+  "rule": "alpha_bar(init) = mean over completed calibration runs of that init of darl_alpha_time_mean (mean over all 18 hidden units and all training steps of DARL's negative slope); nonfinite runs excluded and counted",
+  "calibration_experiment": "darl-slope-calibration",
+  "calibration_experiment_hash": "a8adedfdbe766b1e1070158bfa61bf1d27a2e8d4eefa1eeb5f70dc0d3e41cfc6",
+  "calibration_seeds": {
+    "start": 20,
+    "count": 20
+  },
+  "darl_parameters": {
+    "alpha_min": 0.01,
+    "alpha_max": 0.3,
+    "p": 1.0,
+    "rho": 0.99,
+    "d_init": 0.0,
+    "check_finite": true
+  },
+  "epochs": 2000,
+  "per_init": {
+    "he": {
+      "alpha_bar": 0.15469973950328422,
+      "time_mean_stats": {
+        "n": 20,
+        "mean": 0.15469973950328422,
+        "sd": 0.03136463722703412,
+        "min": 0.10136441397257537,
+        "max": 0.20462958913981372
+      },
+      "final_mean_stats_reported_only": {
+        "n": 20,
+        "mean": 0.15566353127360344,
+        "sd": 0.03227973367062075,
+        "min": 0.09853237867355347,
+        "max": 0.20480553805828094
+      },
+      "n_runs": 20,
+      "n_completed": 20,
+      "n_nonfinite_excluded": 0,
+      "calibration_outcomes": {
+        "success": 20
+      },
+      "per_seed": [
+        {
+          "seed": 20,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.17732193095215673
+        },
+        {
+          "seed": 21,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.12263561464714197
+        },
+        {
+          "seed": 22,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.1509120977825951
+        },
+        {
+          "seed": 23,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.16132601557008455
+        },
+        {
+          "seed": 24,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.1813934694896064
+        },
+        {
+          "seed": 25,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.16030743090360192
+        },
+        {
+          "seed": 26,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.20020408609305743
+        },
+        {
+          "seed": 27,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.12203650616767117
+        },
+        {
+          "seed": 28,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.11493034932477167
+        },
+        {
+          "seed": 29,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.10236470909288618
+        },
+        {
+          "seed": 30,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.1796829272210792
+        },
+        {
+          "seed": 31,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.20462958913981372
+        },
+        {
+          "seed": 32,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.10136441397257537
+        },
+        {
+          "seed": 33,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.12365300557450003
+        },
+        {
+          "seed": 34,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.1374733355724408
+        },
+        {
+          "seed": 35,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.16964634677680443
+        },
+        {
+          "seed": 36,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.15965552778879646
+        },
+        {
+          "seed": 37,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.17910811003877702
+        },
+        {
+          "seed": 38,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.16322824542001277
+        },
+        {
+          "seed": 39,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.1821210785373114
+        }
+      ]
+    },
+    "rai": {
+      "alpha_bar": 0.08678559713341336,
+      "time_mean_stats": {
+        "n": 20,
+        "mean": 0.08678559713341336,
+        "sd": 0.04352849185216903,
+        "min": 0.026501341931851736,
+        "max": 0.23500892819908525
+      },
+      "final_mean_stats_reported_only": {
+        "n": 20,
+        "mean": 0.08624116741120816,
+        "sd": 0.04304242410630982,
+        "min": 0.026194442063570023,
+        "max": 0.23554028570652008
+      },
+      "n_runs": 20,
+      "n_completed": 20,
+      "n_nonfinite_excluded": 0,
+      "calibration_outcomes": {
+        "success": 19,
+        "other": 1
+      },
+      "per_seed": [
+        {
+          "seed": 20,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.0820948852946943
+        },
+        {
+          "seed": 21,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.09815712360038499
+        },
+        {
+          "seed": 22,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.026501341931851736
+        },
+        {
+          "seed": 23,
+          "status": "completed",
+          "outcome": "other",
+          "alpha_time_mean": 0.23500892819908525
+        },
+        {
+          "seed": 24,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.12380858624078489
+        },
+        {
+          "seed": 25,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.11371596747625154
+        },
+        {
+          "seed": 26,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.09826574180742803
+        },
+        {
+          "seed": 27,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.08308718092462125
+        },
+        {
+          "seed": 28,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.09547799928214712
+        },
+        {
+          "seed": 29,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.06118199328787159
+        },
+        {
+          "seed": 30,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.08179764530489532
+        },
+        {
+          "seed": 31,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.07837224812499093
+        },
+        {
+          "seed": 32,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.07122310531026839
+        },
+        {
+          "seed": 33,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.052961680854845324
+        },
+        {
+          "seed": 34,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.07592958682779379
+        },
+        {
+          "seed": 35,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.07463897121241704
+        },
+        {
+          "seed": 36,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.06420140460975624
+        },
+        {
+          "seed": 37,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.12571201922061542
+        },
+        {
+          "seed": 38,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.03455239222406332
+        },
+        {
+          "seed": 39,
+          "status": "completed",
+          "outcome": "success",
+          "alpha_time_mean": 0.059023140933500445
+        }
+      ]
+    }
+  },
+  "created": "2026-11-24",
+  "main_thresholds_hash": "bcbba08297db7d1d5ab6605537f5683a16e4a9de388a0de5f9cb745fd58f27e6",
+  "main_experiment_hash": "032aa137061586295497a586c910a7d3b47cbcb5f6a0de7752f5d3e00e95fe0e"
+}

@@ -141,9 +141,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     relu_ref = [("relu", "he"), ("relu", "rai")]
     plan("pilot: ReLU He + RAI", relu_ref, 20)
-    plan("main reference: ReLU He + RAI", relu_ref, 1000)
-    comp = [("relu", "he"), ("leaky_relu", "he"), ("darl", "he"), ("leaky_relu", "he")]  # last = slope-matched LReLU
-    plan("main comparison (He): ReLU, LReLU 0.01, DARL, slope-matched LReLU", comp, 1000)
+    plan("Step 9 calibration: DARL He + RAI", [("darl", "he"), ("darl", "rai")], 20)
+    for init in ("he", "rai"):
+        comp = [("relu", init), ("leaky_relu", init), ("darl", init), ("leaky_relu", init)]  # last = slope-matched
+        plan(f"Step 9 main, {init} set: ReLU, LReLU 0.01, DARL, LReLU matched", comp, 1000)
+    plan("Step 9 main, all 8 arms", [(a, i) for i in ("he", "rai")
+                                     for a in ("relu", "leaky_relu", "darl", "leaky_relu")], 1000)
+    darl = [r for r in rows if r["activation"] == "darl"]
+    for r in darl:
+        base = [b for b in rows if b["activation"] == "relu" and b["init"] == r["init"]]
+        if base:
+            print(f"  DARL overhead vs ReLU ({r['init']}): training step x"
+                  f"{r['ms_per_step'] / base[0]['ms_per_step']:.2f}, measurement record x"
+                  f"{r['eval_seconds_per_record'] / base[0]['eval_seconds_per_record']:.2f}")
 
     print(f"\nProjected time at {args.budget_epochs} epochs/run, {args.workers} workers "
           "(single-thread processes, linear scaling assumed):")
