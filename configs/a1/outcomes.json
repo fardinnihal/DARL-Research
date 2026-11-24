@@ -4,6 +4,6 @@
   "half_fit_mse": 0.001,
   "half_flat_std_frac": 0.01,
   "const_range_tol": 1e-06,
-  "frozen": false,
-  "frozen_note": "DRAFT - to be calibrated on ReLU pilot runs, then frozen"
+  "frozen": true,
+  "frozen_note": "Reviewed ReLU pilot; 2000-epoch budget; Option A retained | proposal f1e7f80f6c4e (frozen 2026-11-23)"
 }

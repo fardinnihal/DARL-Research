@@ -10,21 +10,40 @@ and produces:
 * outcome counts per arm with exact 95% intervals.
 
 It never trains, never touches run folders, and writes only to
-``<experiment root>/analysis/``. Only experiments of mode "pilot" or
+``<experiment root>/analysis_budget-v2/`` (``ANALYSIS_DIRNAME``). Reports of
+the original rule (v1, ``analysis/``) are never written or overwritten. Only experiments of mode "pilot" or
 "calibration" are accepted, so pilot numbers cannot end up in research tables.
 
-Budget criterion (approved roadmap, decision 1)
------------------------------------------------
+Budget criterion, rule v2 (loss-floor aware; approved after the ReLU pilot)
+-------------------------------------------------------------------------
 The main budget is the shortest candidate B where at least 95% of the
-non-collapsed pilot runs have a training-loss change under 1% over the last
-10% of epochs. Implemented as:
+non-collapsed pilot runs are budget-stable:
 
   L(e)      full-batch training MSE at epoch e (``train_mse``: eval mode, all
             3,000 training points). Only training loss is used.
   change(B) |L(B) - L(0.9 B)| / L(0.9 B)
+  stable(B) L(B) <= loss_floor (1e-5)  OR  change(B) < 0.01
   eligible  status "completed" and NOT collapsed at epoch B (collapse proxy
             with the given thresholds). Nonfinite runs are counted, not used.
-  pass(B)   converged / eligible >= 0.95, with converged = change(B) < 0.01.
+  pass(B)   stable / eligible >= 0.95.
+
+This is a pilot-calibrated ENGINEERING criterion for training-budget
+sufficiency, not proof of mathematical convergence. It is a separate
+classification from the outcome: budget-stable says nothing about success.
+A run plateaued at high loss (e.g. "other" at MSE 0.17) can be budget-stable
+by the 1% clause and keeps its outcome label; the loss floor is a training-MSE
+level, unrelated to the validation-MSE success threshold.
+
+Why rule v1 was replaced. The approved rule v1 was the 1% clause alone
+(``loss_floor=None`` here reproduces it exactly). On the 40-run, 2,000-epoch
+ReLU pilot it passed only 4 of 16 non-collapsed runs, at every candidate
+budget from 1,000 to 2,000 (and, in a 4,000-epoch extension, up to 4,000).
+The 12 failures were all successful runs at training MSE 1e-10 to 5e-6,
+whose loss jumps by 15-45x between neighbouring records with no significant
+trend: v1 was overly sensitive to relative fluctuations at extremely low MSE,
+so it measured optimizer noise rather than training progress. The 4 runs
+that passed were "other" runs frozen near MSE 0.17. ``budget_sensitivity``
+reports rule v1 and the floors 1e-6, 1e-5 and 1e-4 side by side.
 
 Candidates are the epochs B where both B and 0.9 B were recorded. With
 constant-learning-rate Adam, the first B epochs of a 2,000-epoch run are
@@ -112,14 +131,22 @@ __all__ = [
     "plateau_change",
     "candidate_budgets",
     "budget_check",
+    "budget_stable",
+    "budget_sensitivity",
     "gap_report",
     "calibrate_thresholds",
     "outcome_summary",
     "analyze_pilot",
+    "PREDETERMINED_SUCCESS_VAL_MSE",
+    "preview_freeze",
     "freeze_thresholds",
 ]
 
 PILOT_MODES = ("pilot", "calibration")
+BUDGET_RULE_VERSION = "v2-loss-floor"
+DEFAULT_LOSS_FLOOR = 1e-5          # approved: final full-batch training MSE <= 1e-5 counts as stable
+SENSITIVITY_FLOORS = (None, 1e-6, 1e-5, 1e-4)  # None = original rule v1 (1% change only)
+ANALYSIS_DIRNAME = "analysis_budget-v2"
 PILOT_ACTIVATIONS = ("relu",)
 DEFAULT_CHECKPOINTS = (0, 10, 100, 250, 500, 1000, 1500, 2000)
 ZERO = 0.0
@@ -137,8 +164,9 @@ PROXY_VS_PAPER = [
      "ReLU: some hidden layer has z <= 0 for all units on all 3,000 training inputs (exact for ReLU)"),
     ("Dead unit", "unit inactive for all inputs",
      "preactivation z <= 0 at every probe point (q == 1)"),
-    ("Converged (budget)", "not defined by Lu (training length not stated)",
-     "full-batch training MSE changes < 1% over the last 10% of epochs"),
+    ("Budget-stable (rule v2)", "not defined by Lu (training length not stated)",
+     "final full-batch training MSE <= 1e-5, or its change over the last 10% of epochs < 1%; "
+     "an engineering criterion, not mathematical convergence, and separate from the outcome"),
 ]
 
 
@@ -268,10 +296,13 @@ def _collapsed(rec: Dict[str, Any], th: OutcomeThresholds) -> bool:
 
 
 # ------------------------------------------------------------------ tables
-def seed_table(runs: Sequence[Dict[str, Any]], th: OutcomeThresholds) -> List[Dict[str, Any]]:
+def seed_table(runs: Sequence[Dict[str, Any]], th: OutcomeThresholds,
+               loss_floor: Optional[float] = DEFAULT_LOSS_FLOOR) -> List[Dict[str, Any]]:
     rows = []
     for r in runs:
         h = r["history"]
+        stable = (budget_stable(h, r["epochs"], loss_floor)
+                  if r["status"] == "completed" and plateau_change(h, r["epochs"]) is not None else None)
         f = h[-1] if h else {}
         s = f.get("shape", {})
         flags = [_collapsed(x, th) for x in h if "shape" in x]
@@ -296,6 +327,9 @@ def seed_table(runs: Sequence[Dict[str, Any]], th: OutcomeThresholds) -> List[Di
             "dead_units_init": h[0]["neurons"]["dead_count"] if h and "neurons" in h[0] else None,
             "dead_units_final": f["neurons"]["dead_count"] if "neurons" in f else None,
             "failure_phase": (r["failure"] or {}).get("phase"),
+            # Budget stability at the final epoch (rule v2). Separate from "outcome".
+            "budget_stable": None if stable is None else stable["stable"],
+            "budget_stable_by": None if stable is None else stable["by"],
         })
     return rows
 
@@ -346,9 +380,37 @@ def candidate_budgets(runs: Sequence[Dict[str, Any]], window_frac: float = 0.1, 
     return out
 
 
+def budget_stable(history: Sequence[Dict[str, Any]], budget: int,
+                  loss_floor: Optional[float] = DEFAULT_LOSS_FLOOR, tol: float = 0.01,
+                  window_frac: float = 0.1) -> Dict[str, Any]:
+    """Rule v2 for one run at budget B: L(B) <= loss_floor OR change(B) < tol.
+
+    ``loss_floor=None`` is the original rule v1 (change only). ``by`` names the
+    clause that holds ("change" first, then "floor"), or None.
+    """
+    if loss_floor is not None and (isinstance(loss_floor, bool) or not math.isfinite(loss_floor)
+                                   or loss_floor <= 0):
+        raise ValueError(f"loss_floor must be a positive finite number or None, got {loss_floor!r}")
+    rec = record_at(history, budget)
+    c = plateau_change(history, budget, window_frac)
+    if rec is None or c is None:
+        raise ValueError(f"no records at epoch {budget} and its window start")
+    by_change = c < tol
+    by_floor = loss_floor is not None and float(rec["train_mse"]) <= loss_floor
+    return {"stable": bool(by_change or by_floor), "change": c, "train_mse": float(rec["train_mse"]),
+            "by_change": bool(by_change), "by_floor": bool(by_floor),
+            "by": "change" if by_change else ("floor" if by_floor else None)}
+
+
 def budget_check(runs: Sequence[Dict[str, Any]], th: OutcomeThresholds,
                  budgets: Optional[Sequence[int]] = None, tol: float = 0.01,
-                 required: float = 0.95, window_frac: float = 0.1) -> Dict[str, Any]:
+                 required: float = 0.95, window_frac: float = 0.1,
+                 loss_floor: Optional[float] = DEFAULT_LOSS_FLOOR) -> Dict[str, Any]:
+    """Budget check with rule v2 (default ``loss_floor`` 1e-5); ``loss_floor=None`` = rule v1.
+
+    Per budget, ``converged`` counts budget-stable runs (kept as the key name
+    of v1 reports); ``met_by_change`` and ``met_by_floor_only`` split it.
+    """
     budgets = list(budgets) if budgets is not None else candidate_budgets(runs, window_frac)
     if not budgets:
         raise ValueError("no candidate budget has records at both B and 0.9 B")
@@ -356,6 +418,7 @@ def budget_check(runs: Sequence[Dict[str, Any]], th: OutcomeThresholds,
     for b in budgets:
         n_nonfinite = sum(r["status"] == "nonfinite" for r in runs)
         elig, conv, collapsed, changes, worst = 0, 0, 0, [], []
+        by_change = by_floor_only = 0
         per_arm: Dict[str, List[int]] = {}
         for r in runs:
             if r["status"] != "completed":
@@ -366,10 +429,13 @@ def budget_check(runs: Sequence[Dict[str, Any]], th: OutcomeThresholds,
             if _collapsed(rec, th):
                 collapsed += 1
                 continue
-            c = plateau_change(r["history"], b, window_frac)
+            st = budget_stable(r["history"], b, loss_floor, tol, window_frac)
+            c = st["change"]
             elig += 1
-            ok = c < tol
+            ok = st["stable"]
             conv += ok
+            by_change += st["by_change"]
+            by_floor_only += st["by_floor"] and not st["by_change"]
             changes.append(c)
             per_arm.setdefault(r["arm"], [0, 0])
             per_arm[r["arm"]][0] += ok
@@ -380,6 +446,7 @@ def budget_check(runs: Sequence[Dict[str, Any]], th: OutcomeThresholds,
         worst.sort(key=lambda w: -w["change"])
         changes.sort()
         rows.append({"budget": b, "eligible": elig, "converged": conv, "fraction": frac,
+                     "met_by_change": by_change, "met_by_floor_only": by_floor_only,
                      "passes": frac is not None and frac >= required,
                      "excluded_collapsed": collapsed, "excluded_nonfinite": n_nonfinite,
                      "median_change": changes[len(changes) // 2] if changes else None,
@@ -392,11 +459,35 @@ def budget_check(runs: Sequence[Dict[str, Any]], th: OutcomeThresholds,
             recommended = row["budget"]
             break
     top = rows[-1]
+    version = BUDGET_RULE_VERSION if loss_floor is not None else "v1-relative-only"
     return {"criterion": {"loss": "train_mse (full-batch, eval mode)", "tol": tol, "required": required,
-                          "window_frac": window_frac,
+                          "window_frac": window_frac, "loss_floor": loss_floor, "rule_version": version,
+                          "stable_if": (f"train_mse(B) <= {loss_floor:g} or change < {tol:g}"
+                                        if loss_floor is not None else f"change < {tol:g}"),
+                          "note": ("engineering criterion for budget sufficiency, not proof of convergence; "
+                                   "separate from the outcome label"),
                           "rule": "shortest B that passes, with every longer candidate also passing"},
             "budgets": rows, "largest_candidate": top["budget"],
             "largest_candidate_sufficient": top["passes"], "recommended_budget": recommended}
+
+
+def budget_sensitivity(runs: Sequence[Dict[str, Any]], th: OutcomeThresholds,
+                       floors: Sequence[Optional[float]] = SENSITIVITY_FLOORS,
+                       budgets: Optional[Sequence[int]] = None) -> List[Dict[str, Any]]:
+    """The budget decision under rule v1 (None) and several loss floors."""
+    out = []
+    for f in floors:
+        b = budget_check(runs, th, budgets=budgets, loss_floor=f)
+        top = b["budgets"][-1]
+        out.append({"loss_floor": f, "rule_version": b["criterion"]["rule_version"],
+                    "largest_candidate": b["largest_candidate"],
+                    "stable_at_largest": top["converged"], "eligible_at_largest": top["eligible"],
+                    "met_by_floor_only_at_largest": top["met_by_floor_only"],
+                    "largest_candidate_sufficient": b["largest_candidate_sufficient"],
+                    "recommended_budget": b["recommended_budget"],
+                    "passing_budgets": [r["budget"] for r in b["budgets"] if r["passes"]],
+                    "not_stable_at_largest": top["not_converged"]})
+    return out
 
 
 # ------------------------------------------------------------- calibration
@@ -556,7 +647,7 @@ def _g(v: Any, fmt: str = ".3g") -> str:
 
 def _report_md(exp: ExperimentConfig, n_runs: int, problems: List[str], budget: Dict[str, Any],
                cal: Dict[str, Any], s_draft: Dict[str, Any], s_prop: Dict[str, Any],
-               record: Optional[Dict[str, Any]]) -> str:
+               record: Optional[Dict[str, Any]], sensitivity: Optional[List[Dict[str, Any]]] = None) -> str:
     L = [f"# A1 ReLU pilot analysis: {exp.name}", "",
          "**PILOT. Not research results.** ReLU arms only; used to check the training budget and "
          "to calibrate outcome thresholds. No DARL or LeakyReLU comparison is made here.", "",
@@ -567,24 +658,49 @@ def _report_md(exp: ExperimentConfig, n_runs: int, problems: List[str], budget: 
     if problems:
         L += [f"- **Incomplete:** {len(problems)} run(s) missing or unusable:"] + [f"  - {p}" for p in problems]
     c = budget["criterion"]
-    L += ["", "## 1. Training budget (approved criterion)", "",
-          f"Change in full-batch training MSE over the last {c['window_frac']:.0%} of epochs must be under "
-          f"{c['tol']:.0%} for at least {c['required']:.0%} of non-collapsed runs. Collapse at epoch B uses the "
-          "proposed thresholds. Validation loss is not used.", "",
-          "| Budget B | Eligible | Converged | Fraction | Passes | Collapsed (excluded) | Median change | Max change |",
-          "|---|---|---|---|---|---|---|---|"]
+    floor = c.get("loss_floor")
+    rule = (f"final full-batch training MSE <= {floor:g}, OR its change over the last {c['window_frac']:.0%} "
+            f"of epochs < {c['tol']:.0%}" if floor is not None else
+            f"change in full-batch training MSE over the last {c['window_frac']:.0%} of epochs < {c['tol']:.0%}")
+    L += ["", f"## 1. Training budget (rule {c.get('rule_version', 'v1-relative-only')})", "",
+          f"A run is budget-stable if its {rule}. A budget passes if at least {c['required']:.0%} of "
+          "non-collapsed runs are budget-stable. Collapse at epoch B uses the proposed thresholds. "
+          "Validation loss is not used.", "",
+          "This is a pilot-calibrated engineering criterion for training-budget sufficiency, not proof of "
+          "mathematical convergence. Budget stability is a separate classification from the outcome: "
+          "it never makes a run successful, and high-loss plateaued runs keep their outcome label.", ""]
+    if floor is not None:
+        L += ["Rule history: the original rule v1 was the 1% clause alone. On the 2,000-epoch ReLU pilot it "
+              "failed because it was overly sensitive to relative fluctuations at extremely low MSE: "
+              "successful runs at training MSE 1e-10 to 5e-6 fluctuate by 15-45x between records with no "
+              "significant trend, so they failed the 1% clause while plateaued. v1 results are kept in "
+              "analysis/ and in the sensitivity table below.", ""]
+    L += ["| Budget B | Eligible | Stable | Fraction | Passes | By change | By floor only | "
+          "Collapsed (excluded) | Median change | Max change |",
+          "|---|---|---|---|---|---|---|---|---|---|"]
     for r in budget["budgets"]:
         L.append(f"| {r['budget']} | {r['eligible']} | {r['converged']} | {_g(r['fraction'], '.1%')} | "
-                 f"{'yes' if r['passes'] else 'no'} | {r['excluded_collapsed']} | {_g(r['median_change'])} | "
+                 f"{'yes' if r['passes'] else 'no'} | {r.get('met_by_change', 'n/a')} | "
+                 f"{r.get('met_by_floor_only', 'n/a')} | {r['excluded_collapsed']} | {_g(r['median_change'])} | "
                  f"{_g(r['max_change'])} |")
     top = budget["budgets"][-1]
     L += ["", f"**{budget['largest_candidate']} epochs sufficient:** "
           f"{'yes' if budget['largest_candidate_sufficient'] else 'NO'}. "
           f"**Shortest passing budget (all longer budgets also pass):** {_g(budget['recommended_budget'], 'd')}."]
     if top["not_converged"]:
-        L += ["", f"Runs not converged at {top['budget']}: " + ", ".join(
+        L += ["", f"Runs not budget-stable at {top['budget']}: " + ", ".join(
             f"{w['arm']} seed {w['seed']} (change {_g(w['change'])}, train MSE {_g(w['train_mse'])})"
             for w in top["not_converged"])]
+    if sensitivity:
+        L += ["", "Sensitivity of the budget decision to the loss floor:", "",
+              "| Rule | Loss floor | Stable at largest B | By floor only | Largest B sufficient | "
+              "Shortest passing budget | Passing budgets |", "|---|---|---|---|---|---|---|"]
+        for x in sensitivity:
+            pb = x["passing_budgets"]
+            L.append(f"| {x['rule_version']} | {_g(x['loss_floor'])} | {x['stable_at_largest']}/"
+                     f"{x['eligible_at_largest']} | {x['met_by_floor_only_at_largest']} | "
+                     f"{'yes' if x['largest_candidate_sufficient'] else 'NO'} | {_g(x['recommended_budget'], 'd')} | "
+                     f"{(str(pb[0]) + '-' + str(pb[-1]) + f' ({len(pb)})') if pb else 'none'} |")
     L += ["", "## 2. Threshold calibration (proposal; nothing is frozen yet)", "",
           "| Threshold | Draft | Proposed | Decision | Values (zeros) | Nearest below / above | Margin below / above (decades) | Quantity |",
           "|---|---|---|---|---|---|---|---|"]
@@ -621,52 +737,98 @@ def _report_md(exp: ExperimentConfig, n_runs: int, problems: List[str], budget: 
           "", "## 4. Paper definitions vs numerical proxies", "",
           "| Quantity | Paper (theoretical) definition | Numerical proxy used here |", "|---|---|---|"]
     L += [f"| {a} | {b} | {c_} |" for a, b, c_ in PROXY_VS_PAPER]
-    L += ["", "Files: per_seed.csv, checkpoints.csv, budget.json, calibration.json, outcomes_proposed.json, "
-          "summary.json.", ""]
+    L += ["", "Files: per_seed.csv, checkpoints.csv, budget.json, budget_sensitivity.json, calibration.json, "
+          "outcomes_proposed.json, summary.json.", ""]
     return "\n".join(L)
 
 
 def analyze_pilot(exp: ExperimentConfig, draft: OutcomeThresholds, allow_incomplete: bool = False,
                   out_dir: Optional[Path] = None, **gap_kw: Any) -> Dict[str, Any]:
-    """Run the full pilot analysis and write it to ``<root>/analysis``. Returns the summary."""
+    """Run the full pilot analysis (budget rule v2) and write it to ``<root>/analysis_budget-v2``.
+
+    Returns the summary. The v1 folder ``<root>/analysis`` is never written.
+    """
     runs, problems = load_pilot_runs(exp, draft, allow_incomplete=allow_incomplete)
     if not runs:
         raise ValueError("no finished pilot runs to analyse")
     cal = calibrate_thresholds(runs, draft, exp.name, **gap_kw)
     proposed = OutcomeThresholds(**cal["proposed"])
-    budget = budget_check(runs, proposed)
+    budget = budget_check(runs, proposed, loss_floor=DEFAULT_LOSS_FLOOR)
+    sensitivity = budget_sensitivity(runs, proposed)
     s_draft = outcome_summary(runs, draft)
     s_prop = outcome_summary(runs, proposed)
-    out_dir = Path(out_dir) if out_dir is not None else exp.root / "analysis"
+    out_dir = Path(out_dir) if out_dir is not None else exp.root / ANALYSIS_DIRNAME
+    if out_dir.resolve() == (exp.root / "analysis").resolve():
+        raise ValueError("refusing to overwrite the original rule-v1 reports in analysis/")
     out_dir.mkdir(parents=True, exist_ok=True)
     record = _read_json(exp.root / "experiment.json")
     summary = {"experiment": exp.name, "mode": exp.mode, "note": "PILOT - not research results",
                "n_runs": len(runs), "incomplete": problems, "budget": budget,
+               "budget_rule_version": BUDGET_RULE_VERSION, "budget_sensitivity": sensitivity,
                "calibration": {k: cal[k] for k in ("draft_hash", "proposed_hash", "changed", "manual_review")},
                "outcomes_draft": s_draft, "outcomes_proposed": s_prop,
                "experiment_hash": (record or {}).get("experiment_hash")}
     atomic_write_text(out_dir / "per_seed.csv", _csv(seed_table(runs, proposed)))
     atomic_write_text(out_dir / "checkpoints.csv", _csv(checkpoint_table(runs, proposed)))
     atomic_write_text(out_dir / "budget.json", json.dumps(budget, indent=2))
+    atomic_write_text(out_dir / "budget_sensitivity.json", json.dumps(sensitivity, indent=2))
     atomic_write_text(out_dir / "calibration.json", json.dumps(cal, indent=2))
     write_thresholds(out_dir / "outcomes_proposed.json", proposed)
     atomic_write_text(out_dir / "summary.json", json.dumps(summary, indent=2))
     atomic_write_text(out_dir / "pilot_report.md",
-                      _report_md(exp, len(runs), problems, budget, cal, s_draft, s_prop, record))
+                      _report_md(exp, len(runs), problems, budget, cal, s_draft, s_prop, record, sensitivity))
     return summary
 
 
-def freeze_thresholds(proposed_path: Path, target: Path, note: str) -> OutcomeThresholds:
-    """Write the reviewed proposal to ``target`` with frozen=true. Refuses to overwrite a frozen file."""
+PREDETERMINED_SUCCESS_VAL_MSE = 1e-3  # fixed before the pilot; never calibrated
+
+
+def _reviewed_proposal(proposed_path: Path, expected_hash: str) -> OutcomeThresholds:
+    """Load a proposal and check it is the reviewed, unfrozen one with the fixed success criterion."""
+    raw = _read_json(Path(proposed_path))
+    if raw is None:
+        raise ValueError(f"{proposed_path} is missing or not a JSON object")
+    th = OutcomeThresholds(**raw)
+    if th.frozen:
+        raise ValueError(f"{proposed_path} is already marked frozen; freeze only an unfrozen proposal")
+    h = th.hash()
+    exp_h = (expected_hash or "").strip().lower()
+    if len(exp_h) < 12 or not h.startswith(exp_h):
+        raise ValueError(f"proposal hash {h[:12]} does not match the reviewed hash {exp_h or '(none)'!r}; "
+                         "freeze exactly the proposal you reviewed (at least 12 hex characters)")
+    if th.success_val_mse != PREDETERMINED_SUCCESS_VAL_MSE:
+        raise ValueError(f"success_val_mse must stay at its predetermined value {PREDETERMINED_SUCCESS_VAL_MSE:g}, "
+                         f"got {th.success_val_mse!r}")
+    return th
+
+
+def preview_freeze(proposed_path: Path, target: Path, expected_hash: str) -> Dict[str, Any]:
+    """What ``freeze_thresholds`` would write, compared with ``target``. Writes nothing."""
+    th = _reviewed_proposal(proposed_path, expected_hash)
+    cur = _read_json(Path(target)) or {}
+    new = dataclasses.replace(th, frozen=True).to_dict()
+    changes = {k: [cur.get(k), new[k]] for k in new if k != "frozen_note" and cur.get(k) != new[k]}
+    return {"proposal_hash": th.hash(), "target": str(target), "target_frozen": bool(cur.get("frozen")),
+            "would_write": new, "changes": changes}
+
+
+def freeze_thresholds(proposed_path: Path, target: Path, note: str, expected_hash: str) -> OutcomeThresholds:
+    """Write the reviewed proposal to ``target`` with frozen=true.
+
+    Refuses unless: a note is given; the proposal is unfrozen and its hash
+    starts with ``expected_hash`` (the hash shown in the reviewed report);
+    success_val_mse is the predetermined 1e-3; and ``target`` is not already
+    frozen. Nothing is frozen automatically: this runs only on an explicit call.
+    """
     if not note.strip():
         raise ValueError("a freeze note is required (who reviewed what, and from which pilot)")
-    raw = json.loads(Path(proposed_path).read_text(encoding="utf-8"))
-    th = OutcomeThresholds(**raw)
+    th = _reviewed_proposal(proposed_path, expected_hash)
     if Path(target).exists():
         cur = _read_json(Path(target)) or {}
         if cur.get("frozen"):
             raise ValueError(f"{target} is already frozen; thresholds are never re-frozen in place")
-    frozen = dataclasses.replace(th, frozen=True,
-                                 frozen_note=f"{note.strip()} (frozen {_dt.date.today().isoformat()})")
+    frozen = dataclasses.replace(
+        th, frozen=True,
+        frozen_note=f"{note.strip()} | proposal {th.hash()[:12]} (frozen {_dt.date.today().isoformat()})")
     write_thresholds(target, frozen)
     return frozen

@@ -32,6 +32,13 @@ def tiny(tmp_path, **over):
     return ExperimentConfig(**kw)
 
 
+def draft_file(dirpath):
+    """An isolated DRAFT thresholds file (the repo file is frozen since Step 8)."""
+    p = Path(dirpath) / "outcomes_draft.json"
+    write_thresholds(p, OutcomeThresholds())
+    return str(p)
+
+
 def quiet(_msg):
     pass
 
@@ -98,7 +105,7 @@ class TestSmokeConfig:
 # ------------------------------------------------------------------ running
 class TestRun:
     def test_folders_files_and_index(self, tmp_path):
-        exp = tiny(tmp_path)
+        exp = tiny(tmp_path, thresholds=draft_file(tmp_path))
         res = run_experiment(exp, report=quiet)
         assert [r["action"] for r in res] == ["trained"] * 4
         for arm in exp.arms:
@@ -454,8 +461,21 @@ class TestArtifactValidation:
 
 # ------------------------------------------------------------------- modes
 class TestModes:
+    def test_smoke_with_the_frozen_repo_thresholds_records_frozen(self, tmp_path):
+        exp = tiny(tmp_path, seed_count=1, arms=ARMS[:1])  # default = configs/a1/outcomes.json
+        run_experiment(exp, report=quiet)
+        out = read(run_dir_for(exp, ARMS[0], 0) / "outcome.json")
+        assert out["purpose"] == "pilot" and out["thresholds_frozen"] is True
+
+    def test_main_mode_runs_with_the_frozen_repo_thresholds(self, tmp_path):
+        exp = tiny(tmp_path, mode="main", seed_count=1, arms=ARMS[:1])
+        res = run_experiment(exp, report=quiet)
+        assert res[0]["action"] == "trained"
+        out = read(run_dir_for(exp, ARMS[0], 0) / "outcome.json")
+        assert out["purpose"] == "main" and out["thresholds_frozen"] is True
+
     def test_main_mode_refuses_draft_thresholds_before_training(self, tmp_path):
-        exp = tiny(tmp_path, mode="main")
+        exp = tiny(tmp_path, mode="main", thresholds=draft_file(tmp_path))
         with pytest.raises(ValueError, match="DRAFT"):
             run_experiment(exp, report=quiet)
         assert not exp.root.exists()

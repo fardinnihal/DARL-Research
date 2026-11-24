@@ -32,6 +32,20 @@ REPO = Path(__file__).resolve().parents[1]
 CONFIG = REPO / "configs" / "a1" / "outcomes.json"
 DATA = build_a1_datasets()
 TH = OutcomeThresholds()
+# Step 8: configs/a1/outcomes.json is frozen. Its five values are the approved
+# ones (the draft defaults), frozen from the reviewed proposal with this hash.
+STEP8_PROPOSAL_HASH = "f1e7f80f6c4e"
+STEP8_PROPOSAL_NOTE = ("PROPOSED from ReLU pilot 'relu-pilot'; review, then freeze with "
+                       "scripts/a1_pilot.py freeze")
+APPROVED_VALUES = {"collapse_std_frac": 0.01, "success_val_mse": 1e-3, "half_fit_mse": 1e-3,
+                   "half_flat_std_frac": 0.01, "const_range_tol": 1e-6}
+
+
+def draft_file(dirpath):
+    """An isolated DRAFT thresholds file, for tests of draft behaviour."""
+    p = Path(dirpath) / "outcomes_draft.json"
+    write_thresholds(p, OutcomeThresholds())
+    return p
 
 
 def shape(out_std=0.5, left_mse=1e-6, right_mse=1e-6, left_std=0.5, right_std=0.5):
@@ -65,14 +79,34 @@ def val_mse(m):
 
 # --------------------------------------------------------------- thresholds
 class TestThresholds:
-    def test_config_file_matches_draft_defaults(self):
-        th = load_thresholds(CONFIG)
+    def test_draft_file_matches_draft_defaults(self, tmp_path):
+        th = load_thresholds(draft_file(tmp_path))
         assert th == OutcomeThresholds()
         assert th.frozen is False
 
-    def test_draft_thresholds_refused_for_research_runs(self):
+    def test_draft_thresholds_refused_for_research_runs(self, tmp_path):
         with pytest.raises(ValueError, match="DRAFT"):
-            load_thresholds(CONFIG, require_frozen=True)
+            load_thresholds(draft_file(tmp_path), require_frozen=True)
+
+
+class TestFrozenRepoConfig:
+    """Step 8: the production thresholds file is frozen with the approved values."""
+
+    def test_repo_config_is_frozen_with_the_approved_values(self):
+        th = load_thresholds(CONFIG, require_frozen=True)
+        assert th.frozen is True
+        assert {k: v for k, v in th.to_dict().items() if k in APPROVED_VALUES} == APPROVED_VALUES
+        assert dataclasses.replace(th, frozen=False, frozen_note=TH.frozen_note) == TH  # = draft defaults
+
+    def test_repo_config_is_the_reviewed_proposal(self):
+        th = load_thresholds(CONFIG)
+        assert f"proposal {STEP8_PROPOSAL_HASH}" in th.frozen_note
+        proposal = dataclasses.replace(th, frozen=False, frozen_note=STEP8_PROPOSAL_NOTE)
+        assert proposal.hash().startswith(STEP8_PROPOSAL_HASH)
+
+    @pytest.mark.parametrize("purpose", ["pilot", "calibration", "main"])
+    def test_repo_config_accepted_for_every_purpose(self, purpose):
+        assert load_thresholds(CONFIG, purpose=purpose).frozen
 
     def test_frozen_file_accepted(self, tmp_path):
         p = tmp_path / "o.json"
@@ -335,9 +369,11 @@ class TestRunPurpose:
             classify_result(self._completed(), TH)
 
     def test_load_with_purpose(self, tmp_path):
-        assert load_thresholds(CONFIG, purpose="pilot") == TH
+        draft = draft_file(tmp_path)
+        assert load_thresholds(draft, purpose="pilot") == TH
+        assert load_thresholds(draft, purpose="calibration") == TH
         with pytest.raises(ValueError, match="DRAFT"):
-            load_thresholds(CONFIG, purpose="main")
+            load_thresholds(draft, purpose="main")
         p = tmp_path / "frozen.json"
         write_thresholds(p, self.FROZEN)
         assert load_thresholds(p, purpose="main").frozen

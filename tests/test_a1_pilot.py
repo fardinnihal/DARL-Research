@@ -1,5 +1,6 @@
 """Stage 2 (A1), Step 7: ReLU pilot config, budget check, threshold calibration, summary."""
 
+import dataclasses
 import importlib.util
 import json
 import math
@@ -10,12 +11,18 @@ import pytest
 from darl_study.a1.outcomes import OutcomeThresholds, load_thresholds, write_thresholds
 from darl_study.a1.pilot import (
     analyze_pilot,
+    ANALYSIS_DIRNAME,
+    DEFAULT_LOSS_FLOOR,
     budget_check,
+    budget_sensitivity,
+    budget_stable,
     calibrate_thresholds,
     candidate_budgets,
     checkpoint_table,
     clopper_pearson,
+    PREDETERMINED_SUCCESS_VAL_MSE,
     freeze_thresholds,
+    preview_freeze,
     gap_report,
     load_pilot_runs,
     outcome_summary,
@@ -159,15 +166,19 @@ class TestBudget:
         b = budget_check(runs + [bad], DRAFT, budgets=[2000])
         assert b["budgets"][0]["excluded_nonfinite"] == 1 and b["budgets"][0]["eligible"] == 5
 
-    def test_tiny_noisy_losses_are_judged_by_the_approved_rule_only(self):
+    def test_tiny_noisy_losses_fail_rule_v1_and_pass_rule_v2(self):
         def noisy(s):  # tiny loss, large relative noise
             c = flat_curve(1e-7)
             c[1800], c[2000] = 1e-7, 3e-7
             return run("A", s, c)
-        b = budget_check([noisy(s) for s in range(20)], DRAFT, budgets=[2000])
-        row = b["budgets"][0]
-        assert row["fraction"] == 0.0 and not row["passes"] and b["recommended_budget"] is None
-        assert not any("diagnostic" in k for k in row) and "diagnostic" not in b["criterion"]
+        runs = [noisy(s) for s in range(20)]
+        v1 = budget_check(runs, DRAFT, budgets=[2000], loss_floor=None)
+        row = v1["budgets"][0]
+        assert row["fraction"] == 0.0 and not row["passes"] and v1["recommended_budget"] is None
+        assert v1["criterion"]["rule_version"] == "v1-relative-only"
+        assert not any("diagnostic" in k for k in row) and "diagnostic" not in v1["criterion"]
+        v2 = budget_check(runs, DRAFT, budgets=[2000])
+        assert v2["budgets"][0]["passes"] and v2["budgets"][0]["met_by_floor_only"] == 20
 
     def test_budget_never_reads_validation_mse_or_success_threshold(self):
         runs = [run("A", s, {e: 0.1 * 0.95 ** (e / 100) for e in range(0, 2001, 100)}) for s in range(20)]
@@ -279,7 +290,7 @@ class TestSuccessThresholdIsPredetermined:
     def test_report_says_it_is_fixed(self, finished_copy):
         exp = finished_copy
         analyze_pilot(exp, DRAFT)
-        md = (exp.root / "analysis" / "pilot_report.md").read_text(encoding="utf-8")
+        md = (exp.root / ANALYSIS_DIRNAME / "pilot_report.md").read_text(encoding="utf-8")
         assert "| success_val_mse | 0.001 | 0.001 | fixed_predetermined |" in md
 
 
@@ -309,9 +320,18 @@ TINY = {"epochs": 100, "log_every": 10, "checkpoint_every": 50}
 RELU = (Arm("ReLU-He", "relu", "he"), Arm("ReLU-RAI", "relu", "rai"))
 
 
+def draft_file(dirpath):
+    """An isolated DRAFT thresholds file: pilots are run with draft thresholds,
+    while the repo file has been frozen since Step 8."""
+    p = Path(dirpath) / "outcomes_draft.json"
+    if not p.exists():
+        write_thresholds(p, DRAFT)
+    return str(p)
+
+
 def tiny(tmp_path, **over):
     kw = dict(name="p", mode="pilot", seed_start=0, seed_count=2, arms=RELU, train=dict(TINY),
-              results_root=str(tmp_path / "results"))
+              results_root=str(tmp_path / "results"), thresholds=draft_file(tmp_path))
     kw.update(over)
     return ExperimentConfig(**kw)
 
@@ -402,7 +422,7 @@ class TestValidatedArtifacts:
         (_d(exp, 1, 1) / "outcome.json").write_text("{", encoding="utf-8")
         s = analyze_pilot(exp, DRAFT, allow_incomplete=True)
         assert s["n_runs"] == 3 and len(s["incomplete"]) == 1
-        md = (exp.root / "analysis" / "pilot_report.md").read_text(encoding="utf-8")
+        md = (exp.root / ANALYSIS_DIRNAME / "pilot_report.md").read_text(encoding="utf-8")
         assert "Incomplete" in md and "ReLU-RAI seed 1" in md
 
     def test_rerunning_the_runner_repairs_what_the_analyzer_refused(self, finished_copy, monkeypatch):
@@ -434,13 +454,13 @@ class TestAnalyzeRealRuns:
 
     def test_full_analysis_writes_only_the_analysis_folder(self, finished):
         exp = finished
-        before = {p: p.read_bytes() for p in exp.root.rglob("*") if p.is_file() and "analysis" not in p.parts}
+        before = {p: p.read_bytes() for p in exp.root.rglob("*") if p.is_file() and ANALYSIS_DIRNAME not in p.parts}
         s = analyze_pilot(exp, DRAFT)
-        after = {p: p.read_bytes() for p in exp.root.rglob("*") if p.is_file() and "analysis" not in p.parts}
-        assert after == before  # run folders untouched
-        out = exp.root / "analysis"
+        after = {p: p.read_bytes() for p in exp.root.rglob("*") if p.is_file() and ANALYSIS_DIRNAME not in p.parts}
+        assert after == before  # run folders (and any rule-v1 analysis/) untouched
+        out = exp.root / ANALYSIS_DIRNAME
         assert {p.name for p in out.iterdir()} == {
-            "per_seed.csv", "checkpoints.csv", "budget.json", "calibration.json",
+            "per_seed.csv", "checkpoints.csv", "budget.json", "budget_sensitivity.json", "calibration.json",
             "outcomes_proposed.json", "summary.json", "pilot_report.md"}
         assert s["n_runs"] == 4 and s["note"].startswith("PILOT")
         assert [b["budget"] for b in s["budget"]["budgets"]] == [100]
@@ -454,6 +474,7 @@ class TestAnalyzeRealRuns:
         cfg = tmp_path / "pilot.json"
         cfg.write_text(json.dumps({"name": "p", "mode": "pilot", "seeds": {"start": 0, "count": 2},
                                    "train": TINY, "results_root": exp.results_root,
+                                   "thresholds": exp.thresholds,
                                    "arms": [{"name": a.name, "activation": a.activation, "init": a.init}
                                             for a in RELU]}), encoding="utf-8")
         cli = _script("a1_pilot")
@@ -461,29 +482,240 @@ class TestAnalyzeRealRuns:
         assert "not research results" in capsys.readouterr().out
         target = tmp_path / "outcomes.json"
         write_thresholds(target, DRAFT)
-        prop = exp.root / "analysis" / "outcomes_proposed.json"
-        assert cli.main(["freeze", "--proposed", str(prop), "--target", str(target), "--note", "UA reviewed"]) == 0
+        prop = exp.root / ANALYSIS_DIRNAME / "outcomes_proposed.json"
+        h = load_thresholds(prop).hash()[:12]
+        common = ["--proposed", str(prop), "--target", str(target), "--expected-hash", h]
+        assert cli.main(["preview", *common]) == 0
+        assert "nothing written" in capsys.readouterr().out
+        assert load_thresholds(target).frozen is False
+        assert cli.main(["freeze", *common, "--note", "UA reviewed"]) == 0
         frozen = load_thresholds(target, require_frozen=True)
-        assert "UA reviewed" in frozen.frozen_note
-        assert cli.main(["freeze", "--proposed", str(prop), "--target", str(target), "--note", "again"]) == 2
+        assert "UA reviewed" in frozen.frozen_note and h in frozen.frozen_note
+        assert cli.main(["freeze", *common, "--note", "again"]) == 2
 
 
 class TestFreeze:
     def test_requires_note_and_never_refreezes(self, tmp_path):
         p, t = tmp_path / "p.json", tmp_path / "t.json"
-        write_thresholds(p, OutcomeThresholds(success_val_mse=2e-3))
+        prop = OutcomeThresholds(collapse_std_frac=0.02)
+        write_thresholds(p, prop)
+        h = prop.hash()
         with pytest.raises(ValueError, match="note"):
-            freeze_thresholds(p, t, "  ")
-        th = freeze_thresholds(p, t, "reviewed")
-        assert th.frozen and th.success_val_mse == 2e-3
+            freeze_thresholds(p, t, "  ", h)
+        th = freeze_thresholds(p, t, "reviewed", h[:12])
+        assert th.frozen and th.collapse_std_frac == 0.02 and th.success_val_mse == 1e-3
         assert load_thresholds(t, require_frozen=True, purpose="main") == th
         with pytest.raises(ValueError, match="already frozen"):
-            freeze_thresholds(p, t, "again")
+            freeze_thresholds(p, t, "again", h)
 
-    def test_repo_thresholds_are_still_draft(self):
-        assert load_thresholds(REPO / "configs" / "a1" / "outcomes.json").frozen is False
+
+class TestFreezeSafeguards:
+    """Step 8: freeze only the reviewed proposal, with the predetermined success criterion."""
+
+    def _prop(self, tmp_path, **kw):
+        p = tmp_path / "p.json"
+        th = OutcomeThresholds(**kw)
+        write_thresholds(p, th)
+        return p, th.hash()
+
+    def test_success_threshold_must_stay_predetermined(self, tmp_path):
+        assert PREDETERMINED_SUCCESS_VAL_MSE == 1e-3
+        for v in (2e-3, 5e-4, 1.0001e-3):
+            p, h = self._prop(tmp_path, success_val_mse=v)
+            with pytest.raises(ValueError, match="predetermined"):
+                freeze_thresholds(p, tmp_path / "t.json", "x", h)
+            with pytest.raises(ValueError, match="predetermined"):
+                preview_freeze(p, tmp_path / "t.json", h)
+        assert not (tmp_path / "t.json").exists()
+
+    @pytest.mark.parametrize("given", ["", "abc", "0" * 12, "0" * 64])
+    def test_hash_must_match_the_reviewed_proposal(self, tmp_path, given):
+        p, _ = self._prop(tmp_path)
+        with pytest.raises(ValueError, match="reviewed hash"):
+            freeze_thresholds(p, tmp_path / "t.json", "x", given)
+        assert not (tmp_path / "t.json").exists()
+
+    def test_edited_proposal_is_refused(self, tmp_path):
+        p, h = self._prop(tmp_path)
+        raw = json.loads(p.read_text())
+        raw["half_fit_mse"] = 0.1  # changed after review
+        p.write_text(json.dumps(raw))
+        with pytest.raises(ValueError, match="reviewed hash"):
+            freeze_thresholds(p, tmp_path / "t.json", "x", h)
+
+    def test_frozen_or_broken_proposal_is_refused(self, tmp_path):
+        p = tmp_path / "p.json"
+        th = OutcomeThresholds(frozen=True)
+        write_thresholds(p, th)
+        with pytest.raises(ValueError, match="already marked frozen"):
+            freeze_thresholds(p, tmp_path / "t.json", "x", th.hash())
+        p.write_text("{")
+        with pytest.raises(ValueError, match="not a JSON object"):
+            freeze_thresholds(p, tmp_path / "t.json", "x", th.hash())
+
+    def test_preview_writes_nothing_and_lists_changes(self, tmp_path):
+        t = tmp_path / "t.json"
+        write_thresholds(t, OutcomeThresholds())
+        before = t.read_bytes()
+        p, h = self._prop(tmp_path, collapse_std_frac=0.02)
+        pr = preview_freeze(p, t, h)
+        assert t.read_bytes() == before
+        assert pr["changes"] == {"collapse_std_frac": [0.01, 0.02], "frozen": [False, True]}
+        assert pr["would_write"]["frozen"] is True and pr["proposal_hash"] == h
+
+    def test_unchanged_proposal_only_flips_frozen(self, tmp_path):
+        t = tmp_path / "t.json"
+        write_thresholds(t, OutcomeThresholds())
+        p, h = self._prop(tmp_path)
+        assert preview_freeze(p, t, h)["changes"] == {"frozen": [False, True]}
+        th = freeze_thresholds(p, t, "UA, ReLU pilot relu-pilot, budget 2000", h)
+        got = load_thresholds(t, require_frozen=True, purpose="main")
+        assert got == th
+        assert {k: v for k, v in got.to_dict().items() if k not in ("frozen", "frozen_note")} == \
+               {k: v for k, v in OutcomeThresholds().to_dict().items() if k not in ("frozen", "frozen_note")}
+
+    def test_repo_thresholds_are_frozen_and_cannot_be_refrozen(self, tmp_path):
+        repo = REPO / "configs" / "a1" / "outcomes.json"
+        th = load_thresholds(repo, require_frozen=True, purpose="main")
+        assert dataclasses.replace(th, frozen=False, frozen_note=DRAFT.frozen_note) == DRAFT
+        t = tmp_path / "outcomes.json"
+        t.write_bytes(repo.read_bytes())
+        p = tmp_path / "p.json"
+        write_thresholds(p, DRAFT)
+        with pytest.raises(ValueError, match="already frozen"):
+            freeze_thresholds(p, t, "again", DRAFT.hash())
+        assert t.read_bytes() == repo.read_bytes()
 
 
 def test_timing_script_measures_the_runner_metrics():
     src = (REPO / "scripts" / "a1_time.py").read_text(encoding="utf-8")
     assert src.count("extra_metrics=a1_extra_metrics") >= 4
+
+
+# ------------------------------------------------- budget rule v2 (loss floor)
+def _spiky(seed, final, start=1e-8):
+    """Flat curve at ``start`` whose last record (the budget epoch) is ``final``."""
+    c = flat_curve(start)
+    c[1800] = start
+    c[2000] = final
+    return run("RAI", seed, c)
+
+
+def _frozen_other(seed, level=0.17):
+    r = run("RAI", seed, flat_curve(level), left=level, right=level)
+    for h in r["history"]:
+        h["val_mse"] = level
+    return r
+
+
+class TestBudgetRuleV2:
+    """Approved rule v2: stable if final train MSE <= 1e-5 OR change < 1%; >= 95% must be stable."""
+
+    def test_default_floor_is_the_approved_value(self):
+        assert DEFAULT_LOSS_FLOOR == 1e-5
+        b = budget_check([_frozen_other(0)], DRAFT, budgets=[2000])
+        assert b["criterion"]["loss_floor"] == 1e-5 and b["criterion"]["rule_version"] == "v2-loss-floor"
+        assert "not proof of convergence" in b["criterion"]["note"]
+
+    @pytest.mark.parametrize("final,stable,by", [
+        (1e-5, True, "floor"),          # "at most 1e-5": the boundary counts
+        (1.0001e-5, False, None),
+        (3e-6, True, "floor"),
+        (1e-8 * 1.005, True, "change"),  # change clause is checked first
+    ])
+    def test_floor_boundary_and_clause(self, final, stable, by):
+        st = budget_stable(_spiky(0, final)["history"], 2000)
+        assert (st["stable"], st["by"]) == (stable, by)
+
+    def test_floor_none_reproduces_rule_v1_exactly(self):
+        runs = [_spiky(s, 10 ** (-5 - s % 3)) for s in range(10)] + [_frozen_other(20 + s) for s in range(3)]
+        v1 = budget_check(runs, DRAFT, budgets=[1000, 2000], loss_floor=None)
+        for r in v1["budgets"]:
+            assert r["met_by_floor_only"] == 0
+            assert r["converged"] == r["met_by_change"]
+        assert v1["budgets"][-1]["converged"] == 3   # only the frozen high-loss runs pass v1
+
+    def test_high_loss_plateau_is_stable_but_never_success(self):
+        r = _frozen_other(0)
+        assert budget_stable(r["history"], 2000)["by"] == "change"
+        row = seed_table([r], DRAFT)[0]
+        assert row["budget_stable"] is True and row["budget_stable_by"] == "change"
+        assert row["outcome"] == "other"                 # budget stability does not relabel
+        s = outcome_summary([r], DRAFT)["arms"]["RAI"]["outcomes"]
+        assert s["success"]["count"] == 0 and s["other"]["count"] == 1
+
+    def test_floor_never_makes_a_run_successful(self):
+        # Training MSE below the floor, validation MSE above the success threshold.
+        r = _spiky(0, 5e-6)
+        r["history"][-1]["val_mse"] = 0.2
+        r["history"][-1]["shape"].update(left_mse=0.2, right_mse=0.2)
+        row = seed_table([r], DRAFT)[0]
+        assert row["budget_stable_by"] == "floor" and row["outcome"] == "other"
+
+    def test_floor_does_not_read_validation_mse_or_success_threshold(self):
+        runs = [_spiky(s, 10 ** (-4 - s % 3)) for s in range(12)]
+        a = budget_check(runs, DRAFT, budgets=[2000])
+        for r in runs:
+            for h in r["history"]:
+                h["val_mse"] = 1e-12
+        b = budget_check(runs, OutcomeThresholds(success_val_mse=0.5), budgets=[2000])
+        assert a == b
+
+    def test_still_requires_95_percent(self):
+        ok = [_spiky(s, 1e-8) for s in range(19)]
+        assert budget_check(ok + [_spiky(19, 2e-5)], DRAFT, budgets=[2000])["budgets"][0]["passes"]
+        b = budget_check(ok[:18] + [_spiky(18, 2e-5), _spiky(19, 3e-5)], DRAFT, budgets=[2000])
+        assert not b["budgets"][0]["passes"] and not b["largest_candidate_sufficient"]
+
+    def test_collapsed_runs_still_excluded(self):
+        b = budget_check([collapsed_run("A", 0), _spiky(1, 1e-8)], DRAFT, budgets=[2000])
+        assert (b["budgets"][0]["eligible"], b["budgets"][0]["excluded_collapsed"]) == (1, 1)
+
+    @pytest.mark.parametrize("bad", [0.0, -1e-5, float("nan"), float("inf"), True])
+    def test_invalid_floor_refused(self, bad):
+        with pytest.raises(ValueError, match="loss_floor"):
+            budget_check([_spiky(0, 1e-8)], DRAFT, budgets=[2000], loss_floor=bad)
+
+    def test_sensitivity_table(self):
+        # Finals at 5e-7, 5e-6, 5e-5 (noisy) plus one frozen high-loss run.
+        runs = [_spiky(0, 5e-7), _spiky(1, 5e-6), _spiky(2, 5e-5), _frozen_other(3)]
+        sens = {x["loss_floor"]: x for x in budget_sensitivity(runs, DRAFT, budgets=[2000])}
+        assert set(sens) == {None, 1e-6, 1e-5, 1e-4}
+        assert {f: sens[f]["stable_at_largest"] for f in sens} == {None: 1, 1e-6: 2, 1e-5: 3, 1e-4: 4}
+        assert sens[None]["rule_version"] == "v1-relative-only"
+        assert sens[1e-4]["largest_candidate_sufficient"] and not sens[1e-5]["largest_candidate_sufficient"]
+
+
+class TestRuleV2Reports:
+    def test_v1_reports_are_never_overwritten(self, finished_copy):
+        exp = finished_copy
+        v1 = exp.root / "analysis"
+        v1.mkdir(exist_ok=True)
+        (v1 / "pilot_report.md").write_text("ORIGINAL V1 REPORT", encoding="utf-8")
+        analyze_pilot(exp, DRAFT)
+        assert (v1 / "pilot_report.md").read_text(encoding="utf-8") == "ORIGINAL V1 REPORT"
+        with pytest.raises(ValueError, match="rule-v1"):
+            analyze_pilot(exp, DRAFT, out_dir=v1)
+        assert (v1 / "pilot_report.md").read_text(encoding="utf-8") == "ORIGINAL V1 REPORT"
+
+    def test_report_documents_the_rule_change_and_sensitivity(self, finished_copy):
+        exp = finished_copy
+        s = analyze_pilot(exp, DRAFT)
+        md = (exp.root / ANALYSIS_DIRNAME / "pilot_report.md").read_text(encoding="utf-8")
+        assert "rule v2-loss-floor" in md and "training MSE <= 1e-05" in md
+        assert "overly sensitive to relative fluctuations at extremely low MSE" in md
+        assert "not proof of" in md and "separate classification from the outcome" in md
+        assert "Sensitivity of the budget decision to the loss floor" in md
+        assert [x["loss_floor"] for x in s["budget_sensitivity"]] == [None, 1e-6, 1e-5, 1e-4]
+        assert s["budget_rule_version"] == "v2-loss-floor"
+        sens = json.loads((exp.root / ANALYSIS_DIRNAME / "budget_sensitivity.json").read_text())
+        assert sens == s["budget_sensitivity"]
+
+    def test_outcomes_and_thresholds_unchanged_by_the_rule(self, finished_copy):
+        exp = finished_copy
+        s = analyze_pilot(exp, DRAFT)
+        runs, _ = load_pilot_runs(exp, DRAFT)
+        assert s["outcomes_proposed"] == outcome_summary(runs, OutcomeThresholds(**json.loads(
+            (exp.root / ANALYSIS_DIRNAME / "outcomes_proposed.json").read_text())))
+        repo = load_thresholds(REPO / "configs" / "a1" / "outcomes.json")
+        assert dataclasses.replace(repo, frozen=False, frozen_note=DRAFT.frozen_note) == DRAFT
